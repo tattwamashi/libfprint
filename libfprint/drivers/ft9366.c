@@ -71,7 +71,7 @@
 
 /* values the vendor driver settled on for this sensor */
 #define FT9366_FDT_DAC        0x1a
-#define FT9366_IMG_DAC        0x37
+#define FT9366_IMG_DAC        0x3b
 #define FT9366_FDT_BASE_DROP  31   /* baseline = empty-sensor measurement - this */
 #define FT9366_MAX_REINITS    3    /* sensor recalibrations per touch for a bad baseline */
 #define FT9366_FDT_STABLE     8    /* measurement noise: readings this close are "unchanged" */
@@ -79,7 +79,7 @@
 
 #define FT9366_TIMEOUT        1000
 #define FT9366_POLL_MS        20
-#define FT9366_HEAL_POLLS     100  /* re-check the baseline every ~2 s while idle */
+#define FT9366_HEAL_POLLS     10   /* measure while idle every ~0.3 s: also the software finger-down fallback */
 
 /* matcher */
 #define FT9366_SETTLE_MS       40   /* finger-down IRQ fires on first contact: let it land */
@@ -147,6 +147,16 @@ static const Ft9366Op seq_hello[] = {
 
 /* analog front end: image capture configuration */
 static const Ft9366Op seq_afe_image[] = {
+  DAC (FT9366_IMG_DAC),
+  W16 (0x9800, 0x4ffe), W16 (0x9804, 0x27ca),
+  W16 (0x9806, 0x04bb), W16 (0x980a, 0x0483), W16 (0x980b, 0x0208),
+  W16 (0x9807, 0x18e1), W16 (0x9887, 0x0002),
+};
+
+/* software finger-down: the chip is still in finger-detect mode after the
+ * manual measurement, put it back to idle like the init path does */
+static const Ft9366Op seq_idle_afe_image[] = {
+  CMD (0x5a), R8 (0x80), CMD (0xc0), CMD (0xa5),
   DAC (FT9366_IMG_DAC),
   W16 (0x9800, 0x4ffe), W16 (0x9804, 0x27ca),
   W16 (0x9806, 0x04bb), W16 (0x980a, 0x0483), W16 (0x980b, 0x0208),
@@ -268,6 +278,7 @@ struct _FpiDeviceFt9366
   guint           polls;           /* polls since the last baseline check */
   gboolean        have_base;       /* fdt_base / background are valid */
   gboolean        finger_at_init;  /* the last init measured a touched sensor */
+  gboolean        sw_down;         /* finger-down came from a measurement, not the chip IRQ */
 
   /* op runner */
   const Ft9366Op *seq;
@@ -550,8 +561,27 @@ seq_run_n (FpiSsm *ssm, FpDevice *dev, const Ft9366Op *seq, gsize len)
 static void
 store_frame (FpiDeviceFt9366 *self, guint16 *dst)
 {
+  guint nonzero = 0;
+  guint16 max = 0;
+  guint64 sum = 0;
+
   for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
-    dst[i] = reply_u16 (self, i);
+    {
+      dst[i] = reply_u16 (self, i);
+      nonzero += dst[i] != 0;
+      sum += dst[i];
+      max = MAX (max, dst[i]);
+    }
+  fp_dbg ("frame stored: %u of %d pixels nonzero, mean %u, max %u, reply %" G_GSIZE_FORMAT " bytes",
+          nonzero, FT9366_FRAME_PIXELS, (guint) (sum / FT9366_FRAME_PIXELS), max, self->reply_len);
+}
+
+/* A zone that reads 0 (unused on some units) must not wrap to 65505 and
+ * poison the baseline the chip compares against. */
+static inline guint16
+fdt_base_from (guint16 reading)
+{
+  return reading > FT9366_FDT_BASE_DROP ? reading - FT9366_FDT_BASE_DROP : 0;
 }
 
 /* ---- activation: reset, finger-detect baseline, background frame -------- */
@@ -632,7 +662,7 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
       else
         {
           for (guint i = 0; i < 4; i++)
-            self->fdt_base[i] = reply_u16 (self, i) - FT9366_FDT_BASE_DROP;
+            self->fdt_base[i] = fdt_base_from (reply_u16 (self, i));
           self->have_base = TRUE;
         }
       fp_dbg ("fdt baseline %u %u %u %u",
@@ -847,7 +877,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
     case CAPTURE_POLL_CHECK:
       if (reply_u16 (self, 0) == FT9366_IRQ_PENDING)
         fpi_ssm_next_state (ssm);
-      else if (!self->wait_up && ++self->polls >= FT9366_HEAL_POLLS)
+      else if (++self->polls >= FT9366_HEAL_POLLS)
         fpi_ssm_jump_to_state (ssm, CAPTURE_MEASURE_IDLE);
       else
         fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_POLL, FT9366_POLL_MS);
@@ -891,7 +921,13 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case CAPTURE_AFE_IMAGE:
-      seq_run (ssm, dev, seq_afe_image);
+      if (self->sw_down)
+        {
+          self->sw_down = FALSE;
+          seq_run (ssm, dev, seq_idle_afe_image);
+        }
+      else
+        seq_run (ssm, dev, seq_afe_image);
       break;
 
     case CAPTURE_FRAME:
@@ -961,7 +997,10 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       {
         gboolean touched = FALSE, above = TRUE;
 
-        for (guint i = 0; i < 4; i++)
+        /* Only zone 0 follows manual measurements on these units: zones 1-3
+         * keep the value they had when the finger last landed, so they would
+         * report "touched" forever after a capture. */
+        for (guint i = 0; i < 1; i++)
           {
             gint level = reply_u16 (self, i) - FT9366_FDT_BASE_DROP;
 
@@ -1007,7 +1046,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
             if (stable)
               {
                 for (guint i = 0; i < 4; i++)
-                  self->fdt_base[i] = reply_u16 (self, i) - FT9366_FDT_BASE_DROP;
+                  self->fdt_base[i] = fdt_base_from (reply_u16 (self, i));
                 self->base_suspect = FALSE;
                 self->have_last_fdt = FALSE;
                 touched = FALSE;
@@ -1022,9 +1061,22 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
             /* the sensor reads clearly above the baseline: the baseline was
              * taken with a finger on it. Take the free reading instead. */
             for (guint i = 0; i < 4; i++)
-              self->fdt_base[i] = reply_u16 (self, i) - FT9366_FDT_BASE_DROP;
+              self->fdt_base[i] = fdt_base_from (reply_u16 (self, i));
             fp_dbg ("baseline healed to %u %u %u %u", self->fdt_base[0],
                     self->fdt_base[1], self->fdt_base[2], self->fdt_base[3]);
+          }
+
+        if (!self->wait_up && touched)
+          {
+            /* The chip's own finger-down IRQ never fires on some units (zones
+             * 1-3 read 0). The manual measurement sees the touch, so use it. */
+            fp_dbg ("software finger-down from measurement");
+            self->sw_down = TRUE;
+            fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED | FP_FINGER_STATUS_PRESENT);
+            self->frames_taken = 0;
+            self->best_coverage = -1;
+            fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_AFE_IMAGE, FT9366_SETTLE_MS);
+            break;
           }
 
         if (self->wait_up && !touched)
