@@ -30,11 +30,11 @@
  * that evaluate the matcher on recorded captures.
  */
 
-#define FT9366_FRAME_WIDTH  64
+#define FT9366_FRAME_WIDTH 64
 #define FT9366_FRAME_HEIGHT 80
 #define FT9366_FRAME_PIXELS (FT9366_FRAME_WIDTH * FT9366_FRAME_HEIGHT)
 
-#define FT9366_PX_NONE      255  /* image pixel not touched by the finger */
+#define FT9366_PX_NONE 255       /* image pixel not touched by the finger */
 
 /* dead pixels (and the unused edge columns) read ~0 on an empty sensor */
 void ft9366_dead_pixels (const guint16 *background,
@@ -64,7 +64,7 @@ guint ft9366_match (const Ft9366Features *probe,
 typedef struct _Ft9366Template Ft9366Template;
 
 Ft9366Template *ft9366_template_new (const guint8 * const *images,
-                                     guint                n);
+                                     guint                 n);
 void            ft9366_template_free (Ft9366Template *tpl);
 guint           ft9366_template_groups (const Ft9366Template *tpl);
 guint           ft9366_template_match (const Ft9366Template *tpl,
@@ -87,8 +87,24 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (Ft9366Template, ft9366_template_free)
  * or when so many keypoints agree that chance is out of the question
  * (on recorded test sets, other fingers reached at most 6 inliers and 0.56
  * correlation). */
-#define FT9366_MIN_INLIERS   4
-#define FT9366_MIN_NCC       0.65
-#define FT9366_SURE_INLIERS  12
+#define FT9366_MIN_INLIERS 4
+#define FT9366_MIN_NCC 0.65
+#define FT9366_SURE_INLIERS 12
 
 gboolean ft9366_match_accept (const Ft9366MatchInfo *info);
+
+#define FT9366_DAC_MIN 0x28
+#define FT9366_DAC_MAX 0x58
+
+typedef struct
+{
+  gdouble mean;
+  gdouble saturated;
+  gdouble zero;
+} Ft9366BgStats;
+
+void     ft9366_background_stats (const guint16 *background,
+                                  Ft9366BgStats *stats);
+gboolean ft9366_background_ok (const Ft9366BgStats *stats);
+guint    ft9366_next_dac (guint                dac,
+                          const Ft9366BgStats *stats);

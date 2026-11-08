@@ -378,6 +378,24 @@ foreach test_name: unit_tests
     )
 endforeach
 
+if 'ft9366' in drivers
+    ft9366_match_test = executable('test-ft9366-match',
+        sources: [
+            'test-ft9366-match.c',
+            '../libfprint/drivers/ft9366-match.c',
+        ],
+        dependencies: [glib_dep, mathlib_dep],
+        include_directories: include_directories('../libfprint/drivers'),
+        c_args: common_cflags,
+        install: false,
+    )
+    test('ft9366-match',
+        ft9366_match_test,
+        suite: ['unit-tests'],
+        env: envs,
+    )
+endif
+
 # Run udev rule generator with fatal warnings
 hwdb_envs = envs
 hwdb_envs.set('UDEV_HWDB', udev_hwdb.full_path())
